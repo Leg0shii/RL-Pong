@@ -11,6 +11,9 @@ The project demonstrates how a convolutional neural network can learn to control
 - **Experience Replay**: Stores transitions in a replay buffer to break temporal correlations in training samples and stabilize learning.
 - **Target Network**: Improves training stability by periodically updating a separate network to compute target Q-values.
 
+## Gameplay
+View a full game here: https://youtu.be/10e7ZIhSqiY
+
 ## Main Files
 
 - **common.py**  
