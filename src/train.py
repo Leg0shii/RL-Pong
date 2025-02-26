@@ -1,145 +1,218 @@
+import csv
+import json
+import os
 import pickle
-import gymnasium as gym
+import random
+import torch
+
 import ale_py
 import shimmy
-import torch
-import torch.optim as optim
+
 import torch.nn as nn
-from tqdm import trange
+import torch.optim as optim
 import numpy as np
-import time
-import matplotlib.pyplot as plt
+import cv2
+from collections import deque
 from datetime import datetime
-import argparse
+from gymnasium.vector import AsyncVectorEnv
+from matplotlib import pyplot as plt
+from tqdm import trange
 
-from common import DQN, ReplayBuffer, preprocess
+import gymnasium as gym
+from gymnasium.wrappers import FrameStackObservation
+from gymnasium.spaces import Box
 
-def train(args) -> None:
-    """
-    python src/train.py --frame_count 10000
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = gym.make("ALE/Pong-v5", render_mode="rgb_array", frameskip=4)
-    n_actions = env.action_space.n
-    input_shape = (1, 84, 84)
+from common import DQN, ReplayBuffer
 
-    policy_net = DQN(input_shape, n_actions).to(device)
-    target_net = DQN(input_shape, n_actions).to(device)
-    target_net.load_state_dict(policy_net.state_dict())
+# --- No-Op and Fire Wrapper ---
+class NoopAndFireEnv(gym.Wrapper):
+    def __init__(self, env, noop_max=30):
+        super().__init__(env)
+        self.noop_max = noop_max
+        self.noop_action = 0
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        noops = np.random.randint(1, self.noop_max+1)
+        for _ in range(noops):
+            obs, _, done, truncated, info = self.env.step(self.noop_action)
+            if done or truncated:
+                obs, info = self.env.reset(**kwargs)
+        # Try Fire (action 1) if needed:
+        obs, _, done, truncated, info = self.env.step(1)
+        if done or truncated:
+            obs, info = self.env.reset(**kwargs)
+        return obs, info
 
-    replay_buffer = ReplayBuffer(100000)
-    optimizer = optim.Adam(policy_net.parameters(), lr=1e-4)
+# --- Wrapper für Graustufen + Resize (1x84x84) ---
+class PreprocessWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = Box(
+            low=0, high=255, shape=(84, 84), dtype=np.uint8
+        )
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._process(obs), info
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        return self._process(obs), reward, done, truncated, info
+    def _process(self, obs):
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        return cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
 
-    # Load checkpoint if provided
-    frame_start = 0
-    if args.frame_count:
-        frame_start = args.frame_count
-        policy_net.load_state_dict(torch.load(f"checkpoints/policy_net_{frame_start}.pth"))
-        print(f"\nLoaded policy_net with frame_count: {frame_start}")
+def make_env():
+    def _thunk():
+        env = gym.make("ALE/Pong-v5", render_mode="rgb_array", frameskip=4)
+        env = NoopAndFireEnv(env)
+        env = PreprocessWrapper(env)
+        env = FrameStackObservation(env, 4)  # stack 4 frames
+        return env
+    return _thunk
 
-        with open(f"checkpoints/replay_buffer_{frame_start}.pkl", "rb") as f:
-            replay_buffer = pickle.load(f)
-        print(f"Loaded replay buffer from {frame_start}")
+def create_output_dirs(base_dir="outputs"):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(base_dir, timestamp)
+    checkpoints_dir = os.path.join(output_dir, "checkpoints")
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+    return output_dir, checkpoints_dir, plots_dir, timestamp
 
-    epsilon = 1.0
-    epsilon_min = 0.1
-    epsilon_decay = 1e-6
-    gamma = 0.99
-    batch_size = 32
-    target_update_freq = 1000
-    max_frames = 5000000
-    episode_rewards = []
-    losses = []
+def save_config(config, output_dir, timestamp):
+    with open(os.path.join(output_dir, f"config_{timestamp}.json"), "w") as f:
+        json.dump(config, f, indent=4)
 
-    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config_prefix = (f"epsilon-{epsilon}_epsilonmin-{epsilon_min}_epsilondecay-{epsilon_decay}_gamma-{gamma}"
-                     f"_batchsize-{batch_size}_targetupdatefreq-{target_update_freq}_maxframes-{max_frames}")
+def save_checkpoint(policy_net, replay_buffer, frame, checkpoints_dir):
+    torch.save(
+        policy_net.state_dict(),
+        os.path.join(checkpoints_dir, f"policy_net_{frame}.pth")
+    )
 
-    state, _ = env.reset()
-    state = preprocess(state)
-    episode_start_time = time.time()
-    episode = 1
-    episode_reward = 0
+def save_rewards(episode_rewards, output_dir):
+    with open(os.path.join(output_dir, "episode_rewards.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Episode", "Reward"])
+        writer.writerows(enumerate(episode_rewards))
 
-    checkpoint_interval = 100000
-    for frame in trange(frame_start + 1, max_frames + 1):
-        if np.random.rand() < epsilon:
-            action = env.action_space.sample()
-        else:
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                q_values = policy_net(state_tensor)
-            action = int(q_values.argmax(dim=1).item())
-
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        next_proc = preprocess(next_state)
-        replay_buffer.push(state, action, reward, next_proc, done)
-        state = next_proc
-        episode_reward += reward
-
-        if done:
-            episode_duration = time.time() - episode_start_time
-            print(f"\nEpisode {episode} | Reward: {episode_reward} | Frame: {frame} | Time: {episode_duration:.2f}s")
-            episode_rewards.append(episode_reward)
-            state, _ = env.reset()
-            state = preprocess(state)
-            episode_reward = 0
-            episode += 1
-            episode_start_time = time.time()
-
-        if len(replay_buffer) >= batch_size:
-            states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
-            states = torch.tensor(states, dtype=torch.float32, device=device)
-            actions = torch.tensor(actions, dtype=torch.long, device=device)
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-            next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
-            dones = torch.tensor(dones, dtype=torch.float32, device=device)
-
-            q_current = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-            with torch.no_grad():
-                q_next = target_net(next_states).max(dim=1)[0]
-            q_target = rewards + gamma * q_next * (1 - dones)
-
-            loss = nn.MSELoss()(q_current, q_target)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
-
-        epsilon = max(epsilon_min, epsilon - epsilon_decay)
-
-        if frame % target_update_freq == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-
-        if frame % checkpoint_interval == 0:
-            torch.save(policy_net.state_dict(), f"checkpoints/policy_net_{frame}.pth")
-            with open(f"checkpoints/replay_buffer_{frame}.pkl", "wb") as f:
-                pickle.dump(replay_buffer, f)
-            print(f"\nSaved checkpoint at frame {frame}.")
-
-    env.close()
-
-    torch.save(policy_net.state_dict(), f"networks/{start_time}+{config_prefix}_dqn.pth")
-
+def plot_metrics(episode_rewards, losses, plots_dir):
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
     plt.plot(episode_rewards)
     plt.title("Episode Rewards")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
-
     plt.subplot(1, 2, 2)
     plt.plot(losses)
     plt.title("Training Loss")
     plt.xlabel("Update Step")
     plt.ylabel("Loss")
-
     plt.tight_layout()
-    plt.savefig(f"plots/{start_time}+{config_prefix}_training-plots.png")
+    plt.savefig(os.path.join(plots_dir, "training_plots.png"))
+    plt.close()
+
+def main():
+    config = {
+        "num_envs": 8,
+        "max_frames": 5000000,
+        "lr": 2.5e-4,
+        "gamma": 0.99,
+        "batch_size": 32,
+        "buffer_size": 200000,
+        "target_update_freq": 1000,
+        "epsilon": 1.0,
+        "epsilon_min": 0.1,
+        "epsilon_decay": 1e-6
+    }
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    output_dir, checkpoints_dir, plots_dir, timestamp = create_output_dirs()
+    save_config(config, output_dir, timestamp)
+
+    envs = AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
+    n_actions = envs.single_action_space.n
+    # 4 stacked frames, each 84×84
+    input_shape = (4, 84, 84)
+
+    policy_net = DQN(input_shape, n_actions).to(device)
+    target_net = DQN(input_shape, n_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
+    replay_buffer = ReplayBuffer(config["buffer_size"])
+
+    optimizer = optim.RMSprop(policy_net.parameters(), 
+                              lr=config["lr"],
+                              alpha=0.95,
+                              eps=0.01)
+
+    obs, _ = envs.reset()
+    total_rewards = np.zeros(config["num_envs"], dtype=np.float32)
+    episode_rewards = []
+    losses = []
+    epsilon = config["epsilon"]
+    last_print = 0
+
+    def handle_checkpoint(frame):
+        save_checkpoint(policy_net, replay_buffer, frame, checkpoints_dir)
+        print(f"\nCheckpoint saved at frame {frame}.")
+
+    try:
+        for frame in trange(1, config["max_frames"] + 1):
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                q_values = policy_net(obs_t)
+            actions = []
+            for i in range(config["num_envs"]):
+                if np.random.rand() < epsilon:
+                    actions.append(envs.single_action_space.sample())
+                else:
+                    actions.append(int(q_values[i].argmax().item()))
+            next_obs, rewards, dones, truncs, _ = envs.step(actions)
+            for i in range(config["num_envs"]):
+                replay_buffer.push(obs[i], actions[i], rewards[i], 
+                                   next_obs[i], dones[i] or truncs[i])
+                total_rewards[i] += rewards[i]
+                if dones[i] or truncs[i]:
+                    episode_rewards.append(total_rewards[i])
+                    total_rewards[i] = 0.0
+            obs = next_obs
+            if len(replay_buffer) >= config["batch_size"]:
+                s_b, a_b, r_b, ns_b, d_b = replay_buffer.sample(config["batch_size"])
+                s_v = torch.tensor(s_b, dtype=torch.float32, device=device)
+                ns_v = torch.tensor(ns_b, dtype=torch.float32, device=device)
+                a_v = torch.tensor(a_b, dtype=torch.long, device=device)
+                r_v = torch.tensor(r_b, dtype=torch.float32, device=device)
+                d_v = torch.tensor(d_b, dtype=torch.float32, device=device)
+
+                q_current = policy_net(s_v).gather(1, a_v.unsqueeze(1)).squeeze(1)
+                with torch.no_grad():
+                    next_actions = policy_net(ns_v).argmax(dim=1, keepdim=True)
+                    q_next = target_net(ns_v).gather(1, next_actions).squeeze(1)
+                q_target = r_v + config["gamma"] * q_next * (1 - d_v)
+
+                # Huber loss
+                loss = nn.SmoothL1Loss()(q_current, q_target)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+
+            epsilon = max(config["epsilon_min"], epsilon - config["epsilon_decay"])
+            if frame % config["target_update_freq"] == 0:
+                target_net.load_state_dict(policy_net.state_dict())
+            if frame % 200000 == 0:
+                handle_checkpoint(frame)
+
+            current_episodes = len(episode_rewards)
+            if current_episodes % 100 == 0 and current_episodes > last_print:
+                print(f"Average 100 Episode Rewards: {np.mean(episode_rewards[-100:])}")
+                last_print = current_episodes
+
+    except KeyboardInterrupt:
+        print("\nTraining stopped. Saving...")
+
+    finally:
+        envs.close()
+        save_rewards(episode_rewards, output_dir)
+        plot_metrics(episode_rewards, losses, plots_dir)
+        print(f"Done. Data in: {output_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--frame_count", type=int, default=None, help="Frame to load policy and buffer from.")
-    args = parser.parse_args()
-    train(args)
+    main()

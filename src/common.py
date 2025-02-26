@@ -5,15 +5,6 @@ import torch.nn as nn
 import random
 from collections import deque
 
-def preprocess(obs):
-    """
-    Converts an RGB frame to grayscale, resizes to 84x84,
-    and returns it with shape (1, 84, 84).
-    """
-    gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-    return np.expand_dims(resized, axis=0)
-
 class DQN(nn.Module):
     """
     Simple convolutional neural network for DQN.
