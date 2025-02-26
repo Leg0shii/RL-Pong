@@ -37,13 +37,12 @@ class NoopAndFireEnv(gym.Wrapper):
             obs, _, done, truncated, info = self.env.step(self.noop_action)
             if done or truncated:
                 obs, info = self.env.reset(**kwargs)
-        # Try Fire (action 1) if needed:
         obs, _, done, truncated, info = self.env.step(1)
         if done or truncated:
             obs, info = self.env.reset(**kwargs)
         return obs, info
 
-# --- Wrapper für Graustufen + Resize (1x84x84) ---
+# --- Wrapper für Graustufen ---
 class PreprocessWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -65,7 +64,7 @@ def make_env():
         env = gym.make("ALE/Pong-v5", render_mode="rgb_array", frameskip=4)
         env = NoopAndFireEnv(env)
         env = PreprocessWrapper(env)
-        env = FrameStackObservation(env, 4)  # stack 4 frames
+        env = FrameStackObservation(env, 4)
         return env
     return _thunk
 
@@ -129,7 +128,6 @@ def main():
 
     envs = AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
     n_actions = envs.single_action_space.n
-    # 4 stacked frames, each 84×84
     input_shape = (4, 84, 84)
 
     policy_net = DQN(input_shape, n_actions).to(device)
